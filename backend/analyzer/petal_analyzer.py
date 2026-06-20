@@ -3,8 +3,6 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple
 import base64
-import io
-from PIL import Image
 
 
 @dataclass
@@ -23,25 +21,31 @@ class AnalysisResult:
 
     def to_dict(self):
         return {
-            "vein_count": self.vein_count,
-            "serration_area": self.serration_area,
-            "serration_count": self.serration_count,
-            "petal_area": self.petal_area,
-            "petal_perimeter": self.petal_perimeter,
-            "circularity": self.circularity,
-            "contours": [[list(point) for point in contour] for contour in self.contours],
-            "vein_points": [list(point) for point in self.vein_points],
-            "serration_points": [list(point) for point in self.serration_points],
-            "original_width": self.original_width,
-            "original_height": self.original_height,
+            "vein_count": int(self.vein_count),
+            "serration_area": float(self.serration_area),
+            "serration_count": int(self.serration_count),
+            "petal_area": float(self.petal_area),
+            "petal_perimeter": float(self.petal_perimeter),
+            "circularity": float(self.circularity),
+            "contours": [[(int(point[0]), int(point[1])) for point in contour] for contour in self.contours],
+            "vein_points": [(int(point[0]), int(point[1])) for point in self.vein_points],
+            "serration_points": [(int(point[0]), int(point[1])) for point in self.serration_points],
+            "original_width": int(self.original_width),
+            "original_height": int(self.original_height),
         }
 
 
 class PetalAnalyzer:
     def __init__(self):
-        self.kernel_size = 3
-        self.threshold_block_size = 11
-        self.threshold_c = 2
+        self.min_petal_area_ratio = 0.005
+        self.max_petal_area_ratio = 0.95
+        
+        self.min_vein_length_ratio = 0.025
+        self.min_vein_solidity = 0.22
+        self.vein_edge_margin_ratio = 0.04
+        
+        self.min_serration_depth_ratio = 0.008
+        self.min_serration_width_ratio = 0.002
 
     def analyze(self, image_bytes: bytes) -> AnalysisResult:
         img_array = np.frombuffer(image_bytes, np.uint8)
@@ -51,13 +55,14 @@ class PetalAnalyzer:
             raise ValueError("无法解析图片")
 
         original_height, original_width = img.shape[:2]
+        img_area = original_width * original_height
 
-        gray = self._grayscale(img)
-        binary = self._threshold(gray)
+        preprocessed_gray = self._preprocess_image(img)
+        binary = self._segment_petal(img, preprocessed_gray)
         cleaned = self._morphological_clean(binary)
 
         contours, hierarchy = self._find_contours(cleaned)
-        petal_contour = self._find_largest_contour(contours)
+        petal_contour = self._find_petal_contour(contours, img_area)
 
         if petal_contour is None:
             return AnalysisResult(
@@ -71,6 +76,8 @@ class PetalAnalyzer:
                 original_height=original_height,
             )
 
+        petal_contour = self._smooth_contour(petal_contour, kernel_size=1)
+
         petal_area = cv2.contourArea(petal_contour)
         petal_perimeter = cv2.arcLength(petal_contour, True)
 
@@ -78,9 +85,13 @@ class PetalAnalyzer:
         if petal_perimeter > 0:
             circularity = 4 * np.pi * petal_area / (petal_perimeter * petal_perimeter)
 
-        vein_count, vein_points = self._detect_veins(gray, petal_contour)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        vein_count, vein_points = self._detect_veins(
+            gray, petal_contour, img_area
+        )
         serration_area, serration_count, serration_points = self._calculate_serration(
-            petal_contour
+            petal_contour, petal_area
         )
 
         result = AnalysisResult(
@@ -99,27 +110,111 @@ class PetalAnalyzer:
 
         return result
 
-    def _grayscale(self, img: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        return gray
+    def _preprocess_image(self, img: np.ndarray) -> np.ndarray:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l)
+        
+        lab_eq = cv2.merge([l_eq, a, b])
+        bgr_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+        
+        gray = cv2.cvtColor(bgr_eq, cv2.COLOR_BGR2GRAY)
+        
+        denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+        
+        return denoised
 
-    def _threshold(self, gray: np.ndarray) -> np.ndarray:
-        binary = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            self.threshold_block_size,
-            self.threshold_c,
+    def _correct_illumination(self, gray: np.ndarray) -> np.ndarray:
+        kernel_size = max(gray.shape) // 50
+        kernel_size = max(kernel_size, 15)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        
+        struct_elem = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
         )
-        return binary
+        bg = cv2.morphologyEx(gray, cv2.MORPH_OPEN, struct_elem)
+        bg = cv2.GaussianBlur(bg, (kernel_size * 2 + 1, kernel_size * 2 + 1), 0)
+        
+        bg = bg.astype(np.float32)
+        gray_float = gray.astype(np.float32)
+        
+        ratio = gray_float / (bg + 1e-6)
+        corrected = ratio * 128.0
+        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+        
+        return corrected
+
+    def _segment_petal(self, color_img: np.ndarray, gray: np.ndarray) -> np.ndarray:
+        h, w = gray.shape
+        
+        hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
+        hsv_h, hsv_s, hsv_v = cv2.split(hsv)
+        
+        lab = cv2.cvtColor(color_img, cv2.COLOR_BGR2LAB)
+        lab_l, lab_a, lab_b = cv2.split(lab)
+        
+        hue_mask = cv2.inRange(hsv, (120, 20, 50), (175, 255, 255))
+        
+        _, s_otsu = cv2.threshold(
+            hsv_s, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        s_binary = cv2.bitwise_and(s_otsu, hue_mask)
+        
+        _, gray_otsu = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+        
+        combined = cv2.bitwise_and(s_binary, gray_otsu)
+        
+        a_normalized = cv2.normalize(lab_a, None, 0, 255, cv2.NORM_MINMAX)
+        _, a_binary = cv2.threshold(
+            a_normalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        a_binary = cv2.bitwise_and(a_binary, hue_mask)
+        
+        combined = cv2.bitwise_or(combined, a_binary)
+        combined = cv2.bitwise_and(combined, gray_otsu)
+        combined = cv2.bitwise_and(combined, hue_mask)
+        
+        edge_mask = np.ones((h, w), dtype=np.uint8) * 255
+        border_size = int(min(h, w) * 0.02)
+        edge_mask[:border_size, :] = 0
+        edge_mask[-border_size:, :] = 0
+        edge_mask[:, :border_size] = 0
+        edge_mask[:, -border_size:] = 0
+        
+        combined = cv2.bitwise_and(combined, edge_mask)
+        
+        return combined
 
     def _morphological_clean(self, binary: np.ndarray) -> np.ndarray:
-        kernel = np.ones((self.kernel_size, self.kernel_size), np.uint8)
-        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-        return cleaned
+        kernel_small = np.ones((3, 3), np.uint8)
+        kernel_medium = np.ones((5, 5), np.uint8)
+
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_medium)
+
+        contours, _ = cv2.findContours(
+            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        mask = np.zeros_like(cleaned)
+        h, w = cleaned.shape[:2]
+        img_area = h * w
+        min_area = img_area * 0.001
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > min_area:
+                cv2.drawContours(mask, [cnt], -1, 255, -1)
+        
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_medium)
+        mask = cv2.dilate(mask, kernel_small, iterations=1)
+
+        return mask
 
     def _find_contours(self, binary: np.ndarray) -> Tuple[List[np.ndarray], np.ndarray]:
         contours, hierarchy = cv2.findContours(
@@ -127,105 +222,330 @@ class PetalAnalyzer:
         )
         return contours, hierarchy
 
-    def _find_largest_contour(self, contours: List[np.ndarray]) -> np.ndarray:
+    def _find_petal_contour(
+        self, contours: List[np.ndarray], img_area: int
+    ) -> np.ndarray:
         if not contours:
             return None
-        return max(contours, key=cv2.contourArea)
+
+        min_area = img_area * self.min_petal_area_ratio
+        max_area = img_area * self.max_petal_area_ratio
+
+        candidates = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = float(w) / h if h > 0 else 0
+            if aspect_ratio < 0.1 or aspect_ratio > 10:
+                continue
+
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+            if solidity < 0.2:
+                continue
+
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 0
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+
+            rect_area = w * h
+            extent = area / rect_area if rect_area > 0 else 0
+
+            score = area * (0.5 + circularity) * (0.5 + solidity) * (0.5 + extent)
+            candidates.append((score, cnt))
+
+        if not candidates:
+            return max(contours, key=cv2.contourArea)
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    def _smooth_contour(self, contour: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+        contour_float = contour.reshape(-1, 2).astype(np.float32)
+        
+        smoothed = np.copy(contour_float)
+        n = len(contour_float)
+        
+        for i in range(n):
+            total = np.zeros(2, dtype=np.float32)
+            weight_sum = 0.0
+            for j in range(-kernel_size, kernel_size + 1):
+                idx = (i + j) % n
+                weight = 1.0 - abs(j) / (kernel_size + 1)
+                total += contour_float[idx] * weight
+                weight_sum += weight
+            smoothed[i] = total / weight_sum
+        
+        smoothed = smoothed.astype(np.int32).reshape(-1, 1, 2)
+        return smoothed
 
     def _detect_veins(
-        self, gray: np.ndarray, petal_contour: np.ndarray
+        self, gray: np.ndarray, petal_contour: np.ndarray, img_area: int
     ) -> Tuple[int, List[Tuple[int, int]]]:
+        h, w = gray.shape
+        
         mask = np.zeros_like(gray)
         cv2.drawContours(mask, [petal_contour], -1, 255, -1)
 
-        masked_gray = cv2.bitwise_and(gray, gray, mask=mask)
+        petal_area = cv2.contourArea(petal_contour)
+        if petal_area < 500:
+            return 0, []
 
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(masked_gray)
+        petal_size = np.sqrt(petal_area)
+        min_vein_length = max(15, petal_size * self.min_vein_length_ratio)
+        
+        margin = max(5, int(petal_size * self.vein_edge_margin_ratio))
+        inner_kernel = np.ones((margin * 2, margin * 2), np.uint8)
+        inner_mask = cv2.erode(mask, inner_kernel, iterations=1)
 
-        kernel_vert = np.array([[-1, -1, -1], [2, 2, 2], [-1, -1, -1]])
-        kernel_horiz = np.array([[-1, 2, -1], [-1, 2, -1], [-1, 2, -1]])
-        kernel_45 = np.array([[-1, -1, 2], [-1, 2, -1], [2, -1, -1]])
-        kernel_135 = np.array([[2, -1, -1], [-1, 2, -1], [-1, -1, 2]])
+        masked_gray = cv2.bitwise_and(gray, gray, mask=inner_mask)
 
-        edges_vert = cv2.filter2D(enhanced, -1, kernel_vert)
-        edges_horiz = cv2.filter2D(enhanced, -1, kernel_horiz)
-        edges_45 = cv2.filter2D(enhanced, -1, kernel_45)
-        edges_135 = cv2.filter2D(enhanced, -1, kernel_135)
+        kernel_size = max(3, int(petal_size * 0.02))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        struct_elem = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+        
+        blackhat = cv2.morphologyEx(masked_gray, cv2.MORPH_BLACKHAT, struct_elem)
+        tophat = cv2.morphologyEx(masked_gray, cv2.MORPH_TOPHAT, struct_elem)
+        vein_enhanced = cv2.add(blackhat, tophat)
 
-        edges = cv2.addWeighted(edges_vert, 0.25, edges_horiz, 0.25, 0)
-        edges = cv2.addWeighted(edges, 0.5, edges_45, 0.25, 0)
-        edges = cv2.addWeighted(edges, 0.75, edges_135, 0.25, 0)
+        vein_enhanced = cv2.bitwise_and(vein_enhanced, vein_enhanced, mask=inner_mask)
 
-        edges = cv2.bitwise_and(edges, edges, mask=mask)
+        enhanced_pixels = vein_enhanced[inner_mask > 0]
+        if len(enhanced_pixels) == 0:
+            return 0, []
+        
+        mean_val = np.mean(enhanced_pixels)
+        std_val = np.std(enhanced_pixels)
+        threshold = mean_val + std_val * 0.6
+        
+        _, vein_binary = cv2.threshold(
+            vein_enhanced, threshold, 255, cv2.THRESH_BINARY
+        )
+        vein_binary = cv2.bitwise_and(vein_binary, vein_binary, mask=inner_mask)
 
-        _, vein_binary = cv2.threshold(edges, 30, 255, cv2.THRESH_BINARY)
-
-        vein_kernel = np.ones((2, 2), np.uint8)
-        vein_binary = cv2.dilate(vein_binary, vein_kernel, iterations=1)
+        close_kernel_size = max(3, int(petal_size * 0.01))
+        if close_kernel_size % 2 == 0:
+            close_kernel_size += 1
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size)
+        )
+        vein_binary = cv2.morphologyEx(vein_binary, cv2.MORPH_CLOSE, close_kernel)
+        vein_binary = cv2.morphologyEx(vein_binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
         vein_contours, _ = cv2.findContours(
             vein_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        min_vein_length = 15
-        valid_veins = [
-            cnt
-            for cnt in vein_contours
-            if cv2.arcLength(cnt, False) > min_vein_length
-        ]
+        valid_veins = []
+        for cnt in vein_contours:
+            length = cv2.arcLength(cnt, False)
+            if length < min_vein_length:
+                continue
 
-        vein_points = []
-        for vein in valid_veins:
-            M = cv2.moments(vein)
+            area = cv2.contourArea(cnt)
+            if area < max(8, petal_area * 0.00008):
+                continue
+
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            aspect = max(cw, ch) / min(cw, ch) if min(cw, ch) > 0 else 0
+            if aspect < 1.05:
+                continue
+
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+            if solidity < self.min_vein_solidity:
+                continue
+
+            if area > 0:
+                thinness = length * length / (4 * np.pi * area)
+                if thinness < 1.5:
+                    continue
+
+            M = cv2.moments(cnt)
             if M["m00"] != 0:
                 cx = int(M["m10"] / M["m00"])
                 cy = int(M["m01"] / M["m00"])
-                vein_points.append((cx, cy))
+                
+                dist = cv2.pointPolygonTest(petal_contour, (cx, cy), True)
+                if dist > margin * 0.2:
+                    valid_veins.append((cnt, (cx, cy)))
+
+        valid_veins.sort(key=lambda x: cv2.contourArea(x[0]), reverse=True)
+        
+        valid_veins = self._merge_duplicate_veins(valid_veins, petal_contour)
+        
+        max_veins = 100
+        valid_veins = valid_veins[:max_veins]
+
+        vein_points = [vp[1] for vp in valid_veins]
 
         return len(valid_veins), vein_points
+    
+    def _merge_duplicate_veins(
+        self, veins: List, petal_contour: np.ndarray
+    ) -> List:
+        if len(veins) <= 1:
+            return veins
+        
+        M = cv2.moments(petal_contour)
+        if M["m00"] == 0:
+            return veins
+        center_x = int(M["m10"] / M["m00"])
+        center_y = int(M["m01"] / M["m00"])
+        
+        petal_area = cv2.contourArea(petal_contour)
+        petal_size = np.sqrt(petal_area)
+        
+        vein_angles = []
+        vein_radii = []
+        vein_areas = []
+        for cnt, (cx, cy) in veins:
+            angle = np.arctan2(cy - center_y, cx - center_x)
+            if angle < 0:
+                angle += 2 * np.pi
+            vein_angles.append(angle)
+            
+            radius = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+            vein_radii.append(radius)
+            vein_areas.append(cv2.contourArea(cnt))
+        
+        merged = []
+        used = [False] * len(veins)
+        
+        angle_threshold_small = 0.15
+        angle_threshold_large = 0.35
+        
+        for i in range(len(veins)):
+            if used[i]:
+                continue
+            
+            current_group = [i]
+            used[i] = True
+            
+            for j in range(i + 1, len(veins)):
+                if used[j]:
+                    continue
+                
+                angle_diff = abs(vein_angles[i] - vein_angles[j])
+                if angle_diff > np.pi:
+                    angle_diff = 2 * np.pi - angle_diff
+                
+                radius_ratio = min(vein_radii[i], vein_radii[j]) / max(vein_radii[i], vein_radii[j]) if max(vein_radii[i], vein_radii[j]) > 0 else 0
+                
+                px1, py1 = veins[i][1]
+                px2, py2 = veins[j][1]
+                point_dist = np.sqrt((px1 - px2)**2 + (py1 - py2)**2)
+                
+                should_merge = False
+                
+                if angle_diff < angle_threshold_small:
+                    should_merge = True
+                elif angle_diff < angle_threshold_large:
+                    if radius_ratio > 0.6 and point_dist < petal_size * 0.15:
+                        should_merge = True
+                
+                if should_merge:
+                    current_group.append(j)
+                    used[j] = True
+            
+            if len(current_group) == 1:
+                merged.append(veins[current_group[0]])
+            else:
+                max_idx = max(
+                    current_group,
+                    key=lambda idx: vein_areas[idx]
+                )
+                merged.append(veins[max_idx])
+        
+        return merged
 
     def _calculate_serration(
-        self, contour: np.ndarray
+        self, contour: np.ndarray, petal_area: float
     ) -> Tuple[float, int, List[Tuple[int, int]]]:
-        if len(contour) < 5:
+        if len(contour) < 10 or petal_area < 100:
             return 0.0, 0, []
 
-        epsilon = 0.01 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
+        smoothed = self._smooth_contour(contour, kernel_size=1)
 
-        hull = cv2.convexHull(contour)
+        hull = cv2.convexHull(smoothed)
         hull_area = cv2.contourArea(hull)
-        contour_area = cv2.contourArea(contour)
-        serration_area = hull_area - contour_area
+        serration_area = max(0, hull_area - petal_area)
 
-        serration_count = 0
         serration_points = []
+        serration_count = 0
 
-        if len(approx) >= 3:
-            approx_points = approx.reshape(-1, 2)
-            hull_points = cv2.convexHull(approx, returnPoints=True)
-            hull_points = hull_points.reshape(-1, 2)
-
-            for i in range(len(approx_points)):
-                p1 = approx_points[i]
-                p2 = approx_points[(i + 1) % len(approx_points)]
-                p3 = approx_points[(i + 2) % len(approx_points)]
-
-                angle = self._calculate_angle(p1, p2, p3)
-
-                if angle < 160:
-                    serration_count += 1
-                    serration_points.append(tuple(p2.tolist()))
+        try:
+            hull_indices = cv2.convexHull(smoothed, returnPoints=False)
+            
+            if hull_indices is not None and len(hull_indices) > 3:
+                defects = cv2.convexityDefects(smoothed, hull_indices)
+                
+                if defects is not None:
+                    petal_size = np.sqrt(petal_area)
+                    min_depth = petal_size * self.min_serration_depth_ratio
+                    min_width = petal_size * self.min_serration_width_ratio
+                    
+                    for i in range(defects.shape[0]):
+                        s, e, f, d = defects[i, 0]
+                        depth = d / 256.0
+                        
+                        if depth < min_depth:
+                            continue
+                        
+                        start = tuple(smoothed[s][0])
+                        end = tuple(smoothed[e][0])
+                        far = tuple(smoothed[f][0])
+                        
+                        width = np.sqrt(
+                            (end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2
+                        )
+                        if width < min_width:
+                            continue
+                        
+                        serration_count += 1
+                        serration_points.append(far)
+        except Exception:
+            pass
 
         if serration_count == 0:
-            serration_count = max(len(approx) - 4, 0)
-            if serration_count > 0:
-                step = max(1, len(approx) // serration_count)
-                for i in range(0, len(approx), step):
-                    if len(serration_points) < serration_count:
-                        point = approx[i][0]
-                        serration_points.append((int(point[0]), int(point[1])))
+            epsilon = 0.003 * cv2.arcLength(smoothed, True)
+            approx = cv2.approxPolyDP(smoothed, epsilon, True)
+            
+            if len(approx) > 4:
+                approx_points = approx.reshape(-1, 2)
+                petal_size = np.sqrt(petal_area)
+                min_depth = petal_size * self.min_serration_depth_ratio
+                
+                for i in range(len(approx_points)):
+                    p1 = approx_points[i]
+                    p2 = approx_points[(i + 1) % len(approx_points)]
+                    p3 = approx_points[(i + 2) % len(approx_points)]
+
+                    angle = self._calculate_angle(p1, p2, p3)
+
+                    if angle < 170:
+                        mid_point = (p1 + p3) / 2
+                        depth = np.linalg.norm(p2 - mid_point)
+                        
+                        if depth > min_depth * 0.5:
+                            dist = cv2.pointPolygonTest(hull, tuple(p2.tolist()), True)
+                            if dist < -min_depth * 0.1:
+                                serration_count += 1
+                                serration_points.append(tuple(p2.tolist()))
+
+        max_serrations = 200
+        if len(serration_points) > max_serrations:
+            serration_points = serration_points[:max_serrations]
+            serration_count = max_serrations
 
         return serration_area, serration_count, serration_points
 
@@ -253,15 +573,13 @@ class PetalAnalyzer:
             contour = np.array(result.contours[0], dtype=np.int32).reshape(-1, 1, 2)
             cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 2)
 
-            cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 1)
-
         for point in result.vein_points:
-            cv2.circle(overlay, (point[0], point[1]), 3, (255, 0, 0), -1)
+            cv2.circle(overlay, (point[0], point[1]), 4, (255, 0, 0), -1)
 
         for point in result.serration_points:
-            cv2.circle(overlay, (point[0], point[1]), 4, (0, 0, 255), -1)
+            cv2.circle(overlay, (point[0], point[1]), 5, (0, 0, 255), -1)
 
-        alpha = 0.6
+        alpha = 0.7
         cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
 
         _, buffer = cv2.imencode(".png", img)
