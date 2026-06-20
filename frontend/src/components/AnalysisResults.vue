@@ -1,6 +1,26 @@
 <template>
   <div class="analysis-results">
-    <h3 class="text-lg font-semibold text-gray-700 mb-4">分析结果</h3>
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-lg font-semibold text-gray-700">分析结果</h3>
+      <div class="flex items-center gap-2" v-if="props.historyCount > 0">
+        <button
+          class="btn-secondary text-sm px-3 py-1.5"
+          @click="$emit('export-excel')"
+          title="导出 Excel"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+        </button>
+        <button
+          class="text-sm text-gray-500 hover:text-red-500 px-2 py-1"
+          @click="$emit('clear-history')"
+          title="清空历史"
+        >
+          清空
+        </button>
+      </div>
+    </div>
     
     <div v-if="!data" class="text-center py-8 text-gray-400">
       <svg class="w-16 h-16 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -11,6 +31,42 @@
     </div>
 
     <div v-else class="space-y-4">
+      <!-- 花瓣形态分类 -->
+      <div class="p-4 rounded-xl border-2" :class="shapeCardClass">
+        <h4 class="text-sm font-medium text-gray-600 mb-3 flex items-center gap-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01" />
+          </svg>
+          形态分类结果
+        </h4>
+        <div class="flex items-center gap-4">
+          <div class="flex-1">
+            <div class="flex items-center gap-2">
+              <span
+                class="w-3 h-3 rounded-full"
+                :class="shapeDotClass"
+              ></span>
+              <span class="text-2xl font-bold" :class="shapeTextClass">{{ data.shape_type || '未知' }}</span>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">
+              基于面积、周长、锯齿综合判定</div>
+          </div>
+        </div>
+        <div class="mt-3 space-y-1.5">
+          <div v-for="(score, shape) in data.shape_score" :key="shape" class="flex items-center gap-2">
+            <span class="text-xs text-gray-600 w-14">{{ shape }}</span>
+            <div class="flex-1 bg-gray-200 rounded-full h-1.5">
+              <div
+                class="h-1.5 rounded-full transition-all duration-500"
+                :class="shapeBarClass(shape)"
+                :style="{ width: score + '%' }"
+              ></div>
+            </div>
+            <span class="text-xs text-gray-500 w-12 text-right">{{ score.toFixed(1) }}%</span>
+          </div>
+        </div>
+      </div>
+
       <!-- 核心指标 -->
       <div class="grid grid-cols-2 gap-4">
         <div class="stat-card bg-blue-50 rounded-xl p-4 border border-blue-100">
@@ -127,8 +183,14 @@ const props = defineProps({
   data: {
     type: Object,
     default: null
+  },
+  historyCount: {
+    type: Number,
+    default: 0
   }
 })
+
+defineEmits(['export-excel', 'clear-history'])
 
 const serrationRatio = computed(() => {
   if (!props.data || props.data.petal_area === 0) return 0
@@ -138,5 +200,47 @@ const serrationRatio = computed(() => {
 function formatNumber(num) {
   if (num === undefined || num === null) return '0'
   return Number(num).toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+}
+
+const shapeType = computed(() => props.data?.shape_type || '未知')
+
+const shapeCardClass = computed(() => {
+  const map = {
+    '圆形': 'bg-blue-50 border-blue-200',
+    '尖形': 'bg-yellow-50 border-yellow-200',
+    '波浪形': 'bg-red-50 border-red-200',
+    '未知': 'bg-gray-50 border-gray-200'
+  }
+  return map[shapeType.value] || map['未知']
+})
+
+const shapeTextClass = computed(() => {
+  const map = {
+    '圆形': 'text-blue-700',
+    '尖形': 'text-yellow-700',
+    '波浪形': 'text-red-700',
+    '未知': 'text-gray-700'
+  }
+  return map[shapeType.value] || map['未知']
+})
+
+const shapeDotClass = computed(() => {
+  const map = {
+    '圆形': 'bg-blue-500',
+    '尖形': 'bg-yellow-500',
+    '波浪形': 'bg-red-500',
+    '未知': 'bg-gray-500'
+  }
+  return map[shapeType.value] || map['未知']
+})
+
+function shapeBarClass(shape) {
+  const map = {
+    '圆形': 'bg-blue-500',
+    '尖形': 'bg-yellow-500',
+    '波浪形': 'bg-red-500',
+    '未知': 'bg-gray-500'
+  }
+  return map[shape] || map['未知']
 }
 </script>

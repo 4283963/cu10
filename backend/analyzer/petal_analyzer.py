@@ -1,8 +1,13 @@
 import cv2
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import base64
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+from datetime import datetime
 
 
 @dataclass
@@ -13,6 +18,8 @@ class AnalysisResult:
     petal_area: float
     petal_perimeter: float
     circularity: float
+    shape_type: str = ""
+    shape_score: dict = field(default_factory=dict)
     contours: List[List[Tuple[int, int]]] = field(default_factory=list)
     vein_points: List[Tuple[int, int]] = field(default_factory=list)
     serration_points: List[Tuple[int, int]] = field(default_factory=list)
@@ -27,6 +34,8 @@ class AnalysisResult:
             "petal_area": float(self.petal_area),
             "petal_perimeter": float(self.petal_perimeter),
             "circularity": float(self.circularity),
+            "shape_type": self.shape_type,
+            "shape_score": {k: float(v) for k, v in self.shape_score.items()},
             "contours": [[(int(point[0]), int(point[1])) for point in contour] for contour in self.contours],
             "vein_points": [(int(point[0]), int(point[1])) for point in self.vein_points],
             "serration_points": [(int(point[0]), int(point[1])) for point in self.serration_points],
@@ -72,6 +81,8 @@ class PetalAnalyzer:
                 petal_area=0,
                 petal_perimeter=0,
                 circularity=0,
+                shape_type="未知",
+                shape_score={"圆形": 0.0, "尖形": 0.0, "波浪形": 0.0},
                 original_width=original_width,
                 original_height=original_height,
             )
@@ -94,6 +105,11 @@ class PetalAnalyzer:
             petal_contour, petal_area
         )
 
+        shape_type, shape_score = self._classify_shape(
+            petal_contour, petal_area, petal_perimeter, circularity,
+            serration_count, vein_count
+        )
+
         result = AnalysisResult(
             vein_count=vein_count,
             serration_area=serration_area,
@@ -101,6 +117,8 @@ class PetalAnalyzer:
             petal_area=petal_area,
             petal_perimeter=petal_perimeter,
             circularity=circularity,
+            shape_type=shape_type,
+            shape_score=shape_score,
             contours=[petal_contour.reshape(-1, 2).tolist()],
             vein_points=vein_points,
             serration_points=serration_points,
@@ -468,6 +486,65 @@ class PetalAnalyzer:
         
         return merged
 
+    def _classify_shape(
+        self,
+        contour: np.ndarray,
+        petal_area: float,
+        petal_perimeter: float,
+        circularity: float,
+        serration_count: int,
+        vein_count: int,
+    ) -> Tuple[str, dict]:
+        if petal_area < 500:
+            return "未知", {"circular": 0.0, "acute": 0.0, "wavy": 0.0}
+
+        petal_size = np.sqrt(petal_area)
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 1.0
+
+        serration_density = 0
+        if petal_size > 0:
+            serration_density = serration_count / (petal_size * 0.01)
+
+        hull = cv2.convexHull(contour)
+        hull_perimeter = cv2.arcLength(hull, True)
+        perimeter_ratio = petal_perimeter / hull_perimeter if hull_perimeter > 0 else 1.0
+
+        score_circular = 0.0
+        score_acute = 0.0
+        score_wavy = 0.0
+
+        score_circular += max(0, (circularity - 0.6)) / 0.4 * 50
+        if aspect_ratio < 1.4:
+            score_circular += 25
+        if serration_density < 1.5:
+            score_circular += 25
+
+        score_acute += max(0, (aspect_ratio - 1.4)) / 2.0 * 50
+        score_acute += max(0, (0.75 - circularity)) / 0.75 * 30
+        if serration_density < 2.0:
+            score_acute += 20
+
+        score_wavy += max(0, (perimeter_ratio - 1.05)) / 0.3 * 50
+        score_wavy += max(0, serration_density - 1.0) / 3.0 * 30
+        if serration_count > 5:
+            score_wavy += 20
+
+        scores = {
+            "圆形": score_circular,
+            "尖形": score_acute,
+            "波浪形": score_wavy,
+        }
+
+        total = sum(scores.values())
+        if total > 0:
+            scores = {k: v / total * 100 for k, v in scores.items()}
+        else:
+            scores = {k: 33.33 for k in scores}
+
+        shape_type = max(scores, key=scores.get)
+        return shape_type, scores
+
     def _calculate_serration(
         self, contour: np.ndarray, petal_area: float
     ) -> Tuple[float, int, List[Tuple[int, int]]]:
@@ -588,3 +665,148 @@ class PetalAnalyzer:
 
 def image_to_base64(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode("utf-8")
+
+
+def export_results_to_excel(
+    results: List[AnalysisResult],
+    filenames: Optional[List[str]] = None,
+) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "花瓣分析结果"
+
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="10B981", end_color="10B981", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center")
+    cell_alignment = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+
+    shape_color_map = {
+        "圆形": "93C5FD",
+        "尖形": "FCD34D",
+        "波浪形": "F87171",
+        "未知": "D1D5DB",
+    }
+
+    headers = [
+        "序号",
+        "文件名",
+        "花瓣形态",
+        "圆形概率(%)",
+        "尖形概率(%)",
+        "波浪形概率(%)",
+        "花瓣面积(px²)",
+        "花瓣周长(px)",
+        "圆形度",
+        "脉络数量(条)",
+        "锯齿数量(个)",
+        "锯齿总面积(px²)",
+        "锯齿占比(%)",
+        "图像宽度(px)",
+        "图像高度(px)",
+        "分析时间",
+    ]
+
+    for col_num, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_num, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    if filenames is None:
+        filenames = [f"标本_{i+1}.png" for i in range(len(results))]
+
+    shape_stats = {"圆形": 0, "尖形": 0, "波浪形": 0, "未知": 0}
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for row_idx, result in enumerate(results):
+        row = row_idx + 2
+        filename = filenames[row_idx] if row_idx < len(filenames) else f"标本_{row_idx+1}.png"
+
+        serration_ratio = 0.0
+        if result.petal_area > 0:
+            serration_ratio = (result.serration_area / result.petal_area) * 100
+
+        shape_type = result.shape_type or "未知"
+        if shape_type in shape_stats:
+            shape_stats[shape_type] += 1
+        else:
+            shape_stats["未知"] += 1
+
+        shape_fill_color = shape_color_map.get(shape_type, "D1D5DB")
+        shape_fill = PatternFill(
+            start_color=shape_fill_color, end_color=shape_fill_color, fill_type="solid"
+        )
+
+        row_data = [
+            row_idx + 1,
+            filename,
+            shape_type,
+            round(result.shape_score.get("圆形", 0), 2),
+            round(result.shape_score.get("尖形", 0), 2),
+            round(result.shape_score.get("波浪形", 0), 2),
+            round(result.petal_area, 2),
+            round(result.petal_perimeter, 2),
+            round(result.circularity, 4),
+            result.vein_count,
+            result.serration_count,
+            round(result.serration_area, 2),
+            round(serration_ratio, 2),
+            result.original_width,
+            result.original_height,
+            now_str,
+        ]
+
+        for col_num, value in enumerate(row_data, 1):
+            cell = ws.cell(row=row, column=col_num, value=value)
+            cell.alignment = cell_alignment
+            cell.border = thin_border
+            if col_num == 3:
+                cell.fill = shape_fill
+
+    column_widths = [8, 22, 12, 14, 14, 14, 16, 16, 12, 14, 14, 16, 14, 14, 14, 20]
+    for i, width in enumerate(column_widths):
+        ws.column_dimensions[get_column_letter(i + 1)].width = width
+
+    if len(results) > 0:
+        ws_stats = wb.create_sheet(title="形态统计")
+
+        stats_headers = ["花瓣形态", "数量", "占比(%)"]
+        for col_num, header in enumerate(stats_headers, 1):
+            cell = ws_stats.cell(row=1, column=col_num, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
+
+        total = len(results)
+        for row_idx, (shape, count) in enumerate(shape_stats.items()):
+            row = row_idx + 2
+            percentage = (count / total * 100) if total > 0 else 0
+            shape_fill_color = shape_color_map.get(shape, "D1D5DB")
+            shape_fill = PatternFill(
+                start_color=shape_fill_color, end_color=shape_fill_color, fill_type="solid"
+            )
+
+            data_row = [shape, count, round(percentage, 2)]
+            for col_num, value in enumerate(data_row, 1):
+                cell = ws_stats.cell(row=row, column=col_num, value=value)
+                cell.alignment = cell_alignment
+                cell.border = thin_border
+                if col_num == 1:
+                    cell.fill = shape_fill
+
+        ws_stats.column_dimensions["A"].width = 14
+        ws_stats.column_dimensions["B"].width = 10
+        ws_stats.column_dimensions["C"].width = 12
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()

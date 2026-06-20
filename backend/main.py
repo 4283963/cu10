@@ -1,11 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from typing import Optional
+from fastapi.responses import JSONResponse, Response
+from typing import Optional, List
+from pydantic import BaseModel
 import uuid
 import os
+import json
 
-from analyzer.petal_analyzer import PetalAnalyzer, AnalysisResult, image_to_base64
+from analyzer.petal_analyzer import (
+    PetalAnalyzer,
+    AnalysisResult,
+    image_to_base64,
+    export_results_to_excel,
+)
 
 app = FastAPI(
     title="花瓣形态学分析系统 API",
@@ -109,8 +116,6 @@ async def get_overlay_image(file: UploadFile = File(...)):
         result = analyzer.analyze(contents)
         overlay_bytes = analyzer.generate_overlay_image(contents, result)
 
-        from fastapi.responses import Response
-
         return Response(content=overlay_bytes, media_type="image/png")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -118,3 +123,49 @@ async def get_overlay_image(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"生成失败: {str(e)}")
     finally:
         await file.close()
+
+
+class ExcelExportItem(BaseModel):
+    filename: str
+    result: dict
+
+
+@app.post("/api/export/excel")
+async def export_excel(items: List[ExcelExportItem]):
+    try:
+        results = []
+        filenames = []
+        
+        for item in items:
+            r = item.result
+            result = AnalysisResult(
+                vein_count=int(r.get("vein_count", 0)),
+                serration_area=float(r.get("serration_area", 0)),
+                serration_count=int(r.get("serration_count", 0)),
+                petal_area=float(r.get("petal_area", 0)),
+                petal_perimeter=float(r.get("petal_perimeter", 0)),
+                circularity=float(r.get("circularity", 0)),
+                shape_type=str(r.get("shape_type", "未知")),
+                shape_score=r.get("shape_score", {"圆形": 0.0, "尖形": 0.0, "波浪形": 0.0}),
+                contours=r.get("contours", []),
+                vein_points=r.get("vein_points", []),
+                serration_points=r.get("serration_points", []),
+                original_width=int(r.get("original_width", 0)),
+                original_height=int(r.get("original_height", 0)),
+            )
+            results.append(result)
+            filenames.append(item.filename)
+
+        excel_bytes = export_results_to_excel(results, filenames)
+        
+        filename = f"花瓣形态分析结果_{uuid.uuid4().hex[:8]}.xlsx"
+        
+        return Response(
+            content=excel_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}"
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
